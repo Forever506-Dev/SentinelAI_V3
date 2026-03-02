@@ -68,8 +68,11 @@ export default function FirewallPage() {
   const [rulesData, setRulesData] = useState<FirewallRulesResponse | null>(null);
   const [rulesLoading, setRulesLoading] = useState(false);
 
-  // Live rules search (client-side filtering)
+  // Live rules search & filters (client-side filtering)
   const [liveSearch, setLiveSearch] = useState("");
+  const [liveFilterDirection, setLiveFilterDirection] = useState("");
+  const [liveFilterAction, setLiveFilterAction] = useState("");
+  const [liveFilterProfile, setLiveFilterProfile] = useState("");
 
   // Tracked/managed rules
   const [trackedRules, setTrackedRules] = useState<TrackedFirewallRule[]>([]);
@@ -150,15 +153,51 @@ export default function FirewallPage() {
     setTrackedPage(1);
   };
 
+  const hasActiveLiveFilters = liveSearch || liveFilterDirection || liveFilterAction || liveFilterProfile;
+
+  const clearAllLiveFilters = () => {
+    setLiveSearch("");
+    setLiveFilterDirection("");
+    setLiveFilterAction("");
+    setLiveFilterProfile("");
+  };
+
+  /** Parse a Windows profile string like "Domain, Private" into lowercase array */
+  const parseProfileString = (profile: string): string[] => {
+    if (!profile || profile === "—" || profile.toLowerCase() === "any" || profile.toLowerCase() === "all") return [];
+    return profile.split(/[,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+  };
+
   // Filtered live rules (client-side since they come from the agent)
   const filteredLiveRules = rulesData?.rules?.filter((rule: any) => {
-    if (!liveSearch.trim()) return true;
-    const q = liveSearch.toLowerCase();
     const name = (rule.Name || rule.name || "").toLowerCase();
+    const dir = (rule.Direction || rule.direction || "").toLowerCase();
+    const act = (rule.Action || rule.action || "").toLowerCase();
     const proto = (rule.Protocol || rule.protocol || "").toLowerCase();
     const port = String(rule.LocalPort || rule.local_port || "").toLowerCase();
     const remote = (rule.RemoteAddress || rule.remote_address || "").toLowerCase();
-    return name.includes(q) || proto.includes(q) || port.includes(q) || remote.includes(q);
+    const profile = (rule.Profile || rule.profile || "").toLowerCase();
+
+    // Text search
+    if (liveSearch.trim()) {
+      const q = liveSearch.toLowerCase();
+      if (!(name.includes(q) || proto.includes(q) || port.includes(q) || remote.includes(q))) return false;
+    }
+    // Direction filter
+    if (liveFilterDirection) {
+      const dirNorm = dir.includes("in") ? "inbound" : dir.includes("out") ? "outbound" : dir;
+      if (dirNorm !== liveFilterDirection) return false;
+    }
+    // Action filter
+    if (liveFilterAction) {
+      const actNorm = (act.includes("block") || act.includes("drop")) ? "block" : act.includes("allow") ? "allow" : act;
+      if (actNorm !== liveFilterAction) return false;
+    }
+    // Profile filter
+    if (liveFilterProfile) {
+      if (!profile.includes(liveFilterProfile)) return false;
+    }
+    return true;
   }) ?? [];
 
   /* ── Load agents ── */
@@ -361,6 +400,7 @@ export default function FirewallPage() {
           protocol: editProtocol,
           port: editPort || undefined,
           remote_address: editRemoteAddr || undefined,
+          profiles: editProfiles,
           reason: editReason || `Modified rule ${editingRule.name}`,
         });
         if (res.status === "completed") {
@@ -368,7 +408,7 @@ export default function FirewallPage() {
         } else {
           setStatusMsg({ type: "error", text: res.output || "Failed to modify rule." });
         }
-        loadLiveRules();
+        await loadLiveRules();
       }
       setEditModalOpen(false);
       setEditingRule(null);
@@ -585,7 +625,7 @@ export default function FirewallPage() {
                   <h2 className="text-base font-semibold text-white flex items-center gap-2">
                     <Flame className="w-5 h-5 text-sentinel-400" />
                     Active Firewall Rules
-                    {rulesData && <span className="text-xs text-cyber-muted ml-2">({filteredLiveRules.length}{liveSearch ? ` / ${rulesData.total}` : ""} rules)</span>}
+                    {rulesData && <span className="text-xs text-cyber-muted ml-2">({filteredLiveRules.length}{hasActiveLiveFilters ? ` / ${rulesData.total}` : ""} rules)</span>}
                   </h2>
                   <div className="flex items-center gap-2">
                     {hasRole("analyst") && (
@@ -686,15 +726,47 @@ export default function FirewallPage() {
                   </div>
                 )}
 
-                {/* Live rules search */}
-                <div className="px-5 py-2.5 border-b border-cyber-border/50 bg-cyber-bg/30">
-                  <div className="relative max-w-xs">
-                    <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-cyber-muted pointer-events-none" />
-                    <input
-                      type="text" placeholder="Filter live rules..." value={liveSearch}
-                      onChange={(e) => setLiveSearch(e.target.value)}
-                      className="w-full pl-8 pr-3 py-1.5 text-xs bg-cyber-surface border border-cyber-border rounded-lg text-white placeholder:text-cyber-muted focus:outline-none focus:border-sentinel-500 transition-colors"
-                    />
+                {/* Live rules filter bar */}
+                <div className="px-5 py-3 border-b border-cyber-border/50 bg-cyber-bg/30">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {/* Search */}
+                    <div className="relative flex-1 min-w-[200px] max-w-xs">
+                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-cyber-muted pointer-events-none" />
+                      <input
+                        type="text" placeholder="Search rules..." value={liveSearch}
+                        onChange={(e) => setLiveSearch(e.target.value)}
+                        className="w-full pl-8 pr-3 py-1.5 text-xs bg-cyber-surface border border-cyber-border rounded-lg text-white placeholder:text-cyber-muted focus:outline-none focus:border-sentinel-500 transition-colors"
+                      />
+                    </div>
+                    {/* Direction */}
+                    <select value={liveFilterDirection} onChange={(e) => setLiveFilterDirection(e.target.value)}
+                      className="px-2.5 py-1.5 text-xs bg-cyber-surface border border-cyber-border rounded-lg text-cyber-text focus:outline-none focus:border-sentinel-500">
+                      <option value="">All Directions</option>
+                      <option value="inbound">Inbound</option>
+                      <option value="outbound">Outbound</option>
+                    </select>
+                    {/* Action */}
+                    <select value={liveFilterAction} onChange={(e) => setLiveFilterAction(e.target.value)}
+                      className="px-2.5 py-1.5 text-xs bg-cyber-surface border border-cyber-border rounded-lg text-cyber-text focus:outline-none focus:border-sentinel-500">
+                      <option value="">All Actions</option>
+                      <option value="block">Block</option>
+                      <option value="allow">Allow</option>
+                    </select>
+                    {/* Profile */}
+                    <select value={liveFilterProfile} onChange={(e) => setLiveFilterProfile(e.target.value)}
+                      className="px-2.5 py-1.5 text-xs bg-cyber-surface border border-cyber-border rounded-lg text-cyber-text focus:outline-none focus:border-sentinel-500">
+                      <option value="">All Profiles</option>
+                      {PROFILE_OPTIONS.map((p) => (
+                        <option key={p} value={p}>{p.charAt(0).toUpperCase() + p.slice(1)}</option>
+                      ))}
+                    </select>
+                    {/* Clear */}
+                    {hasActiveLiveFilters && (
+                      <button onClick={clearAllLiveFilters}
+                        className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg hover:bg-red-500/20 transition-colors">
+                        <X className="w-3 h-3" /> Clear
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -753,6 +825,7 @@ export default function FirewallPage() {
                                       name, direction: dir, action: act, protocol: proto,
                                       port: String(port).toLowerCase() === "any" ? "" : String(port),
                                       remote_address: String(remote).toLowerCase() === "any" ? "" : String(remote),
+                                      profiles: parseProfileString(profile),
                                       isTracked: false,
                                     })} className="p-1 text-cyber-muted hover:text-sentinel-400 transition-colors" title="Edit Rule">
                                       <Pencil className="w-3.5 h-3.5" />
@@ -774,7 +847,14 @@ export default function FirewallPage() {
                   ) : rulesData ? (
                     <div className="flex flex-col items-center justify-center py-12 text-cyber-muted">
                       <ShieldCheck className="w-8 h-8 mb-2 opacity-30" />
-                      <span className="text-sm">No firewall rules returned</span>
+                      {hasActiveLiveFilters ? (
+                        <>
+                          <span className="text-sm">No rules match filters</span>
+                          <button onClick={clearAllLiveFilters} className="text-xs mt-2 text-sentinel-400 hover:underline">Clear all filters</button>
+                        </>
+                      ) : (
+                        <span className="text-sm">No firewall rules returned</span>
+                      )}
                     </div>
                   ) : (
                     <div className="flex items-center justify-center py-12 text-cyber-muted text-sm">

@@ -95,6 +95,7 @@ class EditRuleRequest(BaseModel):
     protocol: str | None = Field(None, pattern=r"^(tcp|udp|any|icmp)$")
     port: str | None = Field(None, max_length=100)
     remote_address: str | None = Field(None, max_length=255)
+    profiles: list[str] | None = Field(None, description="Windows firewall profiles: domain, private, public")
     reason: str = Field("", max_length=1000)
 
 
@@ -275,6 +276,8 @@ async def edit_firewall_rule(
         params["port"] = req.port
     if req.remote_address is not None:
         params["remote_address"] = req.remote_address
+    if req.profiles is not None:
+        params["profiles"] = req.profiles
 
     cmd_result = await relay_signed_command(agent_id, "firewall_edit", params)
     action = await _record_action(db, agent_id, "firewall_edit", current_user.get("sub"), params, cmd_result, req.reason)
