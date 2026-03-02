@@ -2,7 +2,7 @@
 //!
 //! Cross-platform firewall rule enumeration and manipulation.
 //! Windows: `netsh advfirewall` / `New-NetFirewallRule`
-//! Linux:   `iptables` (fallback `nftables`)
+//! Linux:   `ufw` (Uncomplicated Firewall) — primary
 
 use std::process::Command;
 use serde::{Deserialize, Serialize};
@@ -142,33 +142,41 @@ fn netsh_map_to_rule(m: &std::collections::HashMap<String, String>, default_dir:
 }
 
 fn list_rules_linux(command_id: &str) -> CommandResult {
-    // Try iptables first, fall back to nftables
+    // Use UFW as the primary firewall management tool on Linux.
+    // `ufw status numbered` gives us parseable rule output.
+    // Also capture `ufw status verbose` for the human-readable summary.
+
+    // First check if UFW is available and active
+    let ufw_check = Command::new("sh")
+        .args(["-c", "ufw status 2>/dev/null"])
+        .output();
+
+    let ufw_active = match &ufw_check {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            !stdout.contains("inactive") && !stdout.contains("not loaded")
+        }
+        Err(_) => false,
+    };
+
+    if !ufw_active {
+        // Try to enable UFW if it's installed but inactive
+        let _ = Command::new("sh")
+            .args(["-c", "echo 'y' | ufw enable 2>/dev/null"])
+            .output();
+    }
+
+    // Get verbose status (for human output) and numbered status (for parsing)
     let result = Command::new("sh")
         .args(["-c", r#"
-if command -v iptables >/dev/null 2>&1; then
-  echo "=== IPTABLES ==="
-  echo "--- INPUT ---"
-  iptables -L INPUT -n -v --line-numbers 2>/dev/null
-  echo ""
-  echo "--- OUTPUT ---"
-  iptables -L OUTPUT -n -v --line-numbers 2>/dev/null
-  echo ""
-  echo "--- FORWARD ---"
-  iptables -L FORWARD -n -v --line-numbers 2>/dev/null
-  echo ""
-  echo "=== IPTABLES-JSON ==="
-  iptables-save 2>/dev/null
-elif command -v nft >/dev/null 2>&1; then
-  echo "=== NFTABLES ==="
-  nft list ruleset 2>/dev/null
-else
-  echo "ERROR: No firewall management tool found (iptables/nft)"
-  exit 1
-fi
-
-echo ""
 echo "=== UFW STATUS ==="
-ufw status verbose 2>/dev/null || echo "ufw not available"
+ufw status verbose 2>/dev/null
+echo ""
+echo "=== UFW NUMBERED ==="
+ufw status numbered 2>/dev/null
+echo ""
+echo "=== UFW APP LIST ==="
+ufw app list 2>/dev/null
 "#])
         .output();
 
@@ -176,15 +184,35 @@ ufw status verbose 2>/dev/null || echo "ufw not available"
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-            // Parse iptables-save output into structured rules
-            let rules = parse_iptables_save(&stdout);
+            // Parse UFW numbered output into structured rules
+            let rules = parse_ufw_numbered(&stdout);
             let count = rules.len();
+
+            // Build human-readable summary
+            let mut lines = vec![format!("UFW firewall rules: {}", count)];
+            lines.push(format!("{:<6} {:<40} {:>8} {:>7} {:>6} {:>12} {:>15}",
+                "#", "NAME", "DIR", "ACTION", "PROTO", "PORT", "FROM"));
+            lines.push("─".repeat(100));
+
+            for (i, r) in rules.iter().enumerate() {
+                lines.push(format!("{:<6} {:<40} {:>8} {:>7} {:>6} {:>12} {:>15}",
+                    i + 1,
+                    truncate_str(r["Name"].as_str().unwrap_or("—"), 39),
+                    r["Direction"].as_str().unwrap_or("—"),
+                    r["Action"].as_str().unwrap_or("—"),
+                    r["Protocol"].as_str().unwrap_or("any"),
+                    r["LocalPort"].as_str().unwrap_or("any"),
+                    truncate_str(r["RemoteAddress"].as_str().unwrap_or("Anywhere"), 14),
+                ));
+            }
+
+            let display = format!("{}\n\n{}", lines.join("\n"), stdout);
 
             CommandResult {
                 command_id: command_id.to_string(),
                 status: "completed".into(),
-                output: stdout,
-                data: Some(json!({ "rules": rules, "total": count, "os": "linux" })),
+                output: display,
+                data: Some(json!({ "rules": rules, "total": count, "os": "linux", "firewall": "ufw" })),
                 exit_code: output.status.code(),
             }
         }
@@ -192,66 +220,178 @@ ufw status verbose 2>/dev/null || echo "ufw not available"
     }
 }
 
-/// Parse iptables-save output into structured rule objects.
-fn parse_iptables_save(raw: &str) -> Vec<serde_json::Value> {
+/// Parse `ufw status numbered` output into structured rule objects.
+///
+/// UFW numbered output looks like:
+/// ```text
+/// Status: active
+///
+///      To                         Action      From
+///      --                         ------      ----
+/// [ 1] 22/tcp                     ALLOW IN    Anywhere
+/// [ 2] 80,443/tcp                 ALLOW IN    Anywhere
+/// [ 3] Anywhere                   DENY IN     192.168.1.100
+/// [ 4] 8080                       DENY OUT    Anywhere                   (out)
+/// [ 5] 22/tcp (v6)                ALLOW IN    Anywhere (v6)
+/// ```
+fn parse_ufw_numbered(raw: &str) -> Vec<serde_json::Value> {
     let mut rules = Vec::new();
-    let mut current_chain = String::new();
 
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.starts_with(':') {
-            // Chain declaration like :INPUT ACCEPT [0:0]
-            let parts: Vec<&str> = line[1..].splitn(2, ' ').collect();
-            if !parts.is_empty() {
-                current_chain = parts[0].to_string();
-            }
-        } else if line.starts_with("-A ") {
-            // Rule like -A INPUT -p tcp --dport 22 -j ACCEPT
-            let mut rule = json!({
-                "chain": current_chain,
-                "raw": line,
-                "protocol": "any",
-                "local_port": "any",
-                "remote_address": "any",
-                "action": "unknown",
-            });
+    // Find the "=== UFW NUMBERED ===" section
+    let numbered_section = if let Some(start) = raw.find("=== UFW NUMBERED ===") {
+        &raw[start..]
+    } else {
+        raw
+    };
 
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            let mut i = 0;
-            while i < parts.len() {
-                match parts[i] {
-                    "-p" if i + 1 < parts.len() => {
-                        rule["protocol"] = json!(parts[i + 1]);
-                        i += 1;
-                    }
-                    "--dport" if i + 1 < parts.len() => {
-                        rule["local_port"] = json!(parts[i + 1]);
-                        i += 1;
-                    }
-                    "--sport" if i + 1 < parts.len() => {
-                        rule["remote_port"] = json!(parts[i + 1]);
-                        i += 1;
-                    }
-                    "-s" if i + 1 < parts.len() => {
-                        rule["remote_address"] = json!(parts[i + 1]);
-                        i += 1;
-                    }
-                    "-d" if i + 1 < parts.len() => {
-                        rule["local_address"] = json!(parts[i + 1]);
-                        i += 1;
-                    }
-                    "-j" if i + 1 < parts.len() => {
-                        rule["action"] = json!(parts[i + 1].to_lowercase());
-                        i += 1;
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
+    for line in numbered_section.lines() {
+        let trimmed = line.trim();
+
+        // Match lines like "[ 1] 22/tcp                     ALLOW IN    Anywhere"
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+
+        // Extract the rule number and the rest
+        let after_bracket = match trimmed.find(']') {
+            Some(pos) => trimmed[pos + 1..].trim(),
+            None => continue,
+        };
+
+        // Parse the UFW rule line into components
+        // Format: <to> <action> <direction> <from> [(comment)]
+        if let Some(rule) = parse_ufw_rule_line(after_bracket) {
             rules.push(rule);
         }
     }
+
     rules
+}
+
+/// Parse a single UFW rule line like "22/tcp  ALLOW IN  Anywhere"
+/// into a structured JSON object matching the panel's expected format.
+fn parse_ufw_rule_line(line: &str) -> Option<serde_json::Value> {
+    // Tokenize by splitting on whitespace, but handle multi-word fields
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    // The "To" field is first — e.g. "22/tcp", "80,443/tcp", "Anywhere"
+    let to_field = parts[0];
+
+    // Find the action keyword (ALLOW, DENY, REJECT, LIMIT)
+    let mut action_idx = None;
+    for (i, p) in parts.iter().enumerate() {
+        let upper = p.to_uppercase();
+        if upper == "ALLOW" || upper == "DENY" || upper == "REJECT" || upper == "LIMIT" {
+            action_idx = Some(i);
+            break;
+        }
+    }
+
+    let action_idx = action_idx?;
+    let action_raw = parts[action_idx].to_uppercase();
+
+    // Direction follows action: "IN" or "OUT" (or absent = IN)
+    let (direction, from_start_idx) = if action_idx + 1 < parts.len() {
+        let next = parts[action_idx + 1].to_uppercase();
+        if next == "IN" {
+            ("Inbound".to_string(), action_idx + 2)
+        } else if next == "OUT" {
+            ("Outbound".to_string(), action_idx + 2)
+        } else {
+            ("Inbound".to_string(), action_idx + 1) // default inbound
+        }
+    } else {
+        ("Inbound".to_string(), action_idx + 1)
+    };
+
+    // "From" field is the rest (e.g. "Anywhere", "192.168.1.100", "Anywhere (v6)")
+    let from_field = if from_start_idx < parts.len() {
+        parts[from_start_idx..].join(" ")
+    } else {
+        "Anywhere".to_string()
+    };
+
+    // Clean up "(v6)" or "(out)" markers
+    let from_clean = from_field
+        .replace("(v6)", "")
+        .replace("(out)", "")
+        .trim()
+        .to_string();
+    let from_clean = if from_clean.is_empty() { "Anywhere".to_string() } else { from_clean };
+
+    // Skip pure IPv6 duplicate rules (v6) to avoid clutter
+    if line.contains("(v6)") {
+        return None;
+    }
+
+    // Parse the "To" field: "22/tcp" → port=22, proto=tcp
+    //                        "80,443/tcp" → port=80,443, proto=tcp
+    //                        "Anywhere" → port=any, proto=any
+    //                        "3000" → port=3000, proto=any (both)
+    let (port, protocol) = parse_ufw_to_field(to_field);
+
+    // Normalize the action for the panel
+    let action = match action_raw.as_str() {
+        "ALLOW" => "Allow",
+        "DENY" => "Block",
+        "REJECT" => "Block",
+        "LIMIT" => "Limit",
+        _ => "Unknown",
+    };
+
+    // Build a descriptive name for the rule
+    let name = if port == "any" && from_clean == "Anywhere" {
+        format!("UFW-{}-{}-all", action, direction)
+    } else if port == "any" {
+        format!("UFW-{}-{}-from-{}", action, direction, from_clean.replace('.', "_"))
+    } else {
+        format!("UFW-{}/{}-{}", port, protocol, action.to_lowercase())
+    };
+
+    Some(json!({
+        "Name":          name,
+        "name":          name,
+        "Direction":     direction,
+        "direction":     direction.to_lowercase(),
+        "Action":        action,
+        "action":        action.to_lowercase(),
+        "Protocol":      protocol,
+        "protocol":      protocol,
+        "LocalPort":     port,
+        "local_port":    port,
+        "RemotePort":    "any",
+        "remote_port":   "any",
+        "LocalAddress":  "any",
+        "local_address": "any",
+        "RemoteAddress": from_clean,
+        "remote_address": from_clean.to_lowercase(),
+        "Enabled":       "Yes",
+        "enabled":       true,
+        "Profile":       "any",
+        "profile":       "any",
+    }))
+}
+
+/// Parse a UFW "To" field like "22/tcp", "80,443/tcp", "3000", "Anywhere"
+/// into (port, protocol).
+fn parse_ufw_to_field(to_field: &str) -> (String, String) {
+    let clean = to_field.replace("(v6)", "").trim().to_string();
+
+    if clean.eq_ignore_ascii_case("anywhere") {
+        return ("any".to_string(), "any".to_string());
+    }
+
+    if let Some(slash_pos) = clean.find('/') {
+        let port = clean[..slash_pos].to_string();
+        let proto = clean[slash_pos + 1..].to_lowercase();
+        (port, proto)
+    } else {
+        // Just a port number with no protocol specified → both tcp+udp
+        (clean, "any".to_string())
+    }
 }
 
 // =====================================================================
@@ -341,21 +481,57 @@ fn add_rule_windows(command_id: &str, name: &str, direction: &str, action: &str,
 
 fn add_rule_linux(command_id: &str, direction: &str, action: &str,
                    protocol: &str, port: &str, remote_addr: &str) -> CommandResult {
-    let chain = if direction == "inbound" { "INPUT" } else { "OUTPUT" };
-    let target = if action == "block" { "DROP" } else { "ACCEPT" };
+    // Build UFW command:
+    //   ufw [allow|deny|reject|limit] [in|out] [proto <protocol>] [from <addr>] [to any port <port>]
+    //   ufw allow in proto tcp from 192.168.1.0/24 to any port 22
+    //   ufw deny in from 10.0.0.5
+    //   ufw allow out proto tcp to any port 443
 
-    let mut cmd_str = format!("iptables -A {}", chain);
+    let ufw_action = match action {
+        "block" => "deny",
+        "allow" => "allow",
+        "reject" => "reject",
+        "limit" => "limit",
+        _ => "deny",
+    };
+    let ufw_dir = if direction == "outbound" { "out" } else { "in" };
 
-    if protocol != "any" {
-        cmd_str.push_str(&format!(" -p {}", protocol));
+    let mut cmd_parts: Vec<String> = vec![
+        "ufw".to_string(),
+        ufw_action.to_string(),
+        ufw_dir.to_string(),
+    ];
+
+    // Add protocol if not "any"
+    if protocol != "any" && !protocol.is_empty() {
+        cmd_parts.push("proto".to_string());
+        cmd_parts.push(protocol.to_string());
     }
-    if !port.is_empty() {
-        cmd_str.push_str(&format!(" --dport {}", port));
-    }
+
+    // Add source address
     if !remote_addr.is_empty() {
-        cmd_str.push_str(&format!(" -s {}", remote_addr));
+        cmd_parts.push("from".to_string());
+        cmd_parts.push(remote_addr.to_string());
+    } else {
+        cmd_parts.push("from".to_string());
+        cmd_parts.push("any".to_string());
     }
-    cmd_str.push_str(&format!(" -j {} -m comment --comment \"SentinelAI-managed\"", target));
+
+    // Add destination port
+    if !port.is_empty() {
+        cmd_parts.push("to".to_string());
+        cmd_parts.push("any".to_string());
+        cmd_parts.push("port".to_string());
+        cmd_parts.push(port.to_string());
+    }
+
+    // Add comment for tracking
+    cmd_parts.push("comment".to_string());
+    cmd_parts.push("'SentinelAI-managed'".to_string());
+
+    let cmd_str = cmd_parts.join(" ");
+
+    info!(cmd = %cmd_str, "Adding UFW rule");
 
     let result = Command::new("sh").args(["-c", &cmd_str]).output();
 
@@ -368,19 +544,20 @@ fn add_rule_linux(command_id: &str, direction: &str, action: &str,
             CommandResult {
                 command_id: command_id.to_string(),
                 status: if output.status.success() { "completed" } else { "error" }.into(),
-                output: format!("Rule added: {}\n{}", cmd_str, combined),
+                output: format!("UFW rule added: {}\n{}", cmd_str, combined),
                 data: Some(json!({
-                    "chain": chain,
+                    "firewall": "ufw",
                     "direction": direction,
                     "action": action,
                     "protocol": protocol,
                     "port": port,
                     "remote_address": remote_addr,
+                    "command": cmd_str,
                 })),
                 exit_code: output.status.code(),
             }
         }
-        Err(e) => error_result(command_id, &format!("Failed to add iptables rule: {}", e)),
+        Err(e) => error_result(command_id, &format!("Failed to add UFW rule: {}", e)),
     }
 }
 
@@ -444,27 +621,57 @@ fn delete_rule_windows(command_id: &str, params: &serde_json::Value) -> CommandR
 }
 
 fn delete_rule_linux(command_id: &str, params: &serde_json::Value) -> CommandResult {
-    // Accept either rule_number+chain or raw specification
-    let chain = params.get("chain").and_then(|v| v.as_str()).unwrap_or("INPUT");
+    // UFW supports deletion by rule number (preferred) or by specification.
+    //
+    // By number:  ufw delete 3
+    // By spec:    ufw delete allow in proto tcp from any to any port 22
+
     let rule_number = params.get("rule_number").and_then(|v| v.as_u64());
 
     let cmd_str = if let Some(num) = rule_number {
-        format!("iptables -D {} {}", chain, num)
+        // Delete by rule number (most reliable)
+        format!("echo 'y' | ufw delete {}", num)
     } else {
-        // Try to delete by specification
-        let protocol = params.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
+        // Reconstruct the UFW rule specification for deletion
+        let direction = params.get("direction").and_then(|v| v.as_str()).unwrap_or("inbound");
+        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("deny");
+        let protocol = params.get("protocol").and_then(|v| v.as_str()).unwrap_or("any");
         let port = params.get("port").and_then(|v| v.as_str()).unwrap_or("");
         let remote = params.get("remote_address").and_then(|v| v.as_str()).unwrap_or("");
-        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("DROP");
-        let target = if action == "block" || action == "DROP" { "DROP" } else { "ACCEPT" };
 
-        let mut s = format!("iptables -D {}", chain);
-        if !protocol.is_empty() { s.push_str(&format!(" -p {}", protocol)); }
-        if !port.is_empty() { s.push_str(&format!(" --dport {}", port)); }
-        if !remote.is_empty() { s.push_str(&format!(" -s {}", remote)); }
-        s.push_str(&format!(" -j {}", target));
-        s
+        let ufw_action = match action {
+            "block" | "deny" | "DROP" => "deny",
+            "allow" | "ACCEPT" => "allow",
+            "reject" | "REJECT" => "reject",
+            "limit" => "limit",
+            _ => "deny",
+        };
+        let ufw_dir = if direction == "outbound" { "out" } else { "in" };
+
+        let mut parts = vec![
+            "echo 'y' | ufw delete".to_string(),
+            ufw_action.to_string(),
+            ufw_dir.to_string(),
+        ];
+
+        if protocol != "any" && !protocol.is_empty() {
+            parts.push(format!("proto {}", protocol));
+        }
+
+        if !remote.is_empty() {
+            parts.push(format!("from {}", remote));
+        } else {
+            parts.push("from any".to_string());
+        }
+
+        if !port.is_empty() {
+            parts.push(format!("to any port {}", port));
+        }
+
+        parts.join(" ")
     };
+
+    info!(cmd = %cmd_str, "Deleting UFW rule");
 
     let result = Command::new("sh").args(["-c", &cmd_str]).output();
 
@@ -477,12 +684,12 @@ fn delete_rule_linux(command_id: &str, params: &serde_json::Value) -> CommandRes
             CommandResult {
                 command_id: command_id.to_string(),
                 status: if output.status.success() { "completed" } else { "error" }.into(),
-                output: format!("Delete: {}\n{}", cmd_str, combined),
-                data: Some(json!({ "command": cmd_str })),
+                output: format!("UFW delete: {}\n{}", cmd_str, combined),
+                data: Some(json!({ "command": cmd_str, "firewall": "ufw" })),
                 exit_code: output.status.code(),
             }
         }
-        Err(e) => error_result(command_id, &format!("Failed to delete rule: {}", e)),
+        Err(e) => error_result(command_id, &format!("Failed to delete UFW rule: {}", e)),
     }
 }
 
@@ -501,13 +708,7 @@ pub fn edit_rule(command_id: &str, params: &serde_json::Value) -> CommandResult 
     if cfg!(windows) {
         edit_rule_windows(command_id, name, params)
     } else {
-        // On Linux, we need rule_number to delete, then re-add
-        let chain = params.get("chain").and_then(|v| v.as_str()).unwrap_or("INPUT");
-        if let Some(num) = params.get("rule_number").and_then(|v| v.as_u64()) {
-            let del_cmd = format!("iptables -D {} {}", chain, num);
-            let _ = Command::new("sh").args(["-c", &del_cmd]).output();
-        }
-        add_rule(command_id, params)
+        edit_rule_linux(command_id, name, params)
     }
 }
 
@@ -665,6 +866,70 @@ fn edit_rule_windows(command_id: &str, name: &str, params: &serde_json::Value) -
     }
 }
 
+/// Edit a firewall rule on Linux using UFW.
+/// UFW doesn't support in-place edits, so we delete the old rule and re-add with new params.
+/// We find the rule by number (preferred) or by matching the rule specification.
+fn edit_rule_linux(command_id: &str, name: &str, params: &serde_json::Value) -> CommandResult {
+    info!(name = %name, "Editing UFW rule (delete + re-add)");
+
+    // Try to find the rule number by matching name in the UFW numbered list
+    if let Some(rule_num) = find_ufw_rule_number(name) {
+        let del_cmd = format!("echo 'y' | ufw delete {}", rule_num);
+        info!(cmd = %del_cmd, "Deleting old UFW rule by number");
+        let _ = Command::new("sh").args(["-c", &del_cmd]).output();
+    } else if let Some(num) = params.get("rule_number").and_then(|v| v.as_u64()) {
+        let del_cmd = format!("echo 'y' | ufw delete {}", num);
+        let _ = Command::new("sh").args(["-c", &del_cmd]).output();
+    }
+    // If we couldn't find/delete the old rule, we still add the new one
+
+    // Re-add with updated parameters
+    add_rule(command_id, params)
+}
+
+/// Search `ufw status numbered` output to find the rule number matching a given name/port.
+fn find_ufw_rule_number(name: &str) -> Option<u64> {
+    let output = Command::new("sh")
+        .args(["-c", "ufw status numbered 2>/dev/null"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Extract port from name patterns like "UFW-22/tcp-allow" or "Block-Port-tcp-443"
+    let search_terms: Vec<&str> = name.split(&['-', '/', '_'][..]).collect();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+
+        // Check if any search term matches this line
+        let line_lower = trimmed.to_lowercase();
+        let name_lower = name.to_lowercase();
+
+        // Try exact-ish matching: if the name contains a port, look for that port in the line
+        let matches = search_terms.iter().any(|term| {
+            let t = term.to_lowercase();
+            // Only match meaningful terms (ports, ips, not generic words)
+            t.parse::<u16>().is_ok() && line_lower.contains(&t)
+        }) || line_lower.contains(&name_lower);
+
+        if matches {
+            // Extract the number from "[ 3]"
+            if let Some(start) = trimmed.find('[') {
+                if let Some(end) = trimmed.find(']') {
+                    let num_str = trimmed[start + 1..end].trim();
+                    return num_str.parse::<u64>().ok();
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Check if a rule name exists in Windows Firewall, trying exact name then SentinelAI- prefix.
 fn resolve_rule_name_windows(name: &str) -> Option<String> {
     // Try exact name first
@@ -769,8 +1034,214 @@ pub fn toggle_rule(command_id: &str, params: &serde_json::Value) -> CommandResul
             Err(e) => error_result(command_id, &format!("Failed to toggle rule: {}", e)),
         }
     } else {
-        // Linux iptables doesn't have enable/disable — we delete or re-add
-        error_result(command_id, "Toggle not supported on Linux iptables — use delete/add instead")
+        toggle_rule_linux(command_id, name, enabled)
+    }
+}
+
+/// Toggle a firewall rule on Linux using UFW.
+///
+/// UFW has no native enable/disable toggle per-rule. We implement this by:
+/// - **Disable**: Delete the matching rule and save its UFW specification to a state file
+///   (`/var/lib/sentinelai/disabled_rules.json`) so it can be restored.
+/// - **Enable**: Read the saved specification from the state file and re-add it.
+fn toggle_rule_linux(command_id: &str, name: &str, enabled: bool) -> CommandResult {
+    let state_path = "/var/lib/sentinelai/disabled_rules.json";
+
+    // Load existing disabled rules state
+    let mut disabled: std::collections::HashMap<String, String> = std::fs::read_to_string(state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    if enabled {
+        // Re-enable: restore the saved UFW rule specification
+        if let Some(ufw_cmd) = disabled.remove(name) {
+            info!(name = %name, cmd = %ufw_cmd, "Re-enabling UFW rule");
+            let result = Command::new("sh").args(["-c", &ufw_cmd]).output();
+
+            // Persist updated state
+            let _ = std::fs::create_dir_all("/var/lib/sentinelai");
+            let _ = std::fs::write(state_path, serde_json::to_string_pretty(&disabled).unwrap_or_default());
+
+            match result {
+                Ok(output) if output.status.success() => {
+                    CommandResult {
+                        command_id: command_id.to_string(),
+                        status: "completed".into(),
+                        output: format!("Rule '{}' re-enabled via UFW: {}", name, ufw_cmd),
+                        data: Some(json!({ "rule_name": name, "enabled": true, "firewall": "ufw" })),
+                        exit_code: output.status.code(),
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    error_result(command_id, &format!("Failed to re-enable rule '{}': {}", name, stderr))
+                }
+                Err(e) => error_result(command_id, &format!("Failed to run UFW: {}", e)),
+            }
+        } else {
+            error_result(command_id, &format!("Rule '{}' not found in disabled rules state", name))
+        }
+    } else {
+        // Disable: find the rule in UFW, save its spec for re-enable, then delete it
+        // First, try to reconstruct the UFW add command from the current rules
+        if let Some(rule_num) = find_ufw_rule_number(name) {
+            // Get the rule specification before deleting
+            let ufw_spec = reconstruct_ufw_add_command(name);
+
+            // Delete by number
+            let del_cmd = format!("echo 'y' | ufw delete {}", rule_num);
+            info!(cmd = %del_cmd, "Disabling UFW rule by number");
+            let del_result = Command::new("sh").args(["-c", &del_cmd]).output();
+
+            match del_result {
+                Ok(output) if output.status.success() => {
+                    // Save the UFW add-command for re-enabling later
+                    if let Some(spec) = ufw_spec {
+                        disabled.insert(name.to_string(), spec);
+                    }
+                    let _ = std::fs::create_dir_all("/var/lib/sentinelai");
+                    let _ = std::fs::write(state_path, serde_json::to_string_pretty(&disabled).unwrap_or_default());
+
+                    CommandResult {
+                        command_id: command_id.to_string(),
+                        status: "completed".into(),
+                        output: format!("Rule '{}' disabled (removed from UFW, saved for re-enable)", name),
+                        data: Some(json!({ "rule_name": name, "enabled": false, "firewall": "ufw" })),
+                        exit_code: Some(0),
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    error_result(command_id, &format!("Failed to disable rule: {}", stderr))
+                }
+                Err(e) => error_result(command_id, &format!("Failed to delete UFW rule: {}", e)),
+            }
+        } else {
+            error_result(command_id, &format!(
+                "Could not locate rule '{}' in UFW numbered list", name))
+        }
+    }
+}
+
+/// Try to reconstruct a `ufw allow/deny ...` command from the named rule's parsed data.
+/// This is used by toggle to save the rule specification for later re-enabling.
+fn reconstruct_ufw_add_command(name: &str) -> Option<String> {
+    // Parse the name to extract rule parameters
+    // Names look like: "UFW-22/tcp-allow", "UFW-Block-Inbound-from-192_168_1_100"
+    // Or from block_ip/block_port: "Block-192-168-1-5", "Block-Port-tcp-443"
+
+    let output = Command::new("sh")
+        .args(["-c", "ufw status numbered 2>/dev/null"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let search_terms: Vec<&str> = name.split(&['-', '/', '_'][..]).collect();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+
+        let line_lower = trimmed.to_lowercase();
+        let name_lower = name.to_lowercase();
+
+        let matches = search_terms.iter().any(|term| {
+            let t = term.to_lowercase();
+            t.parse::<u16>().is_ok() && line_lower.contains(&t)
+        }) || line_lower.contains(&name_lower);
+
+        if matches {
+            // Parse this line to reconstruct the ufw add command
+            if let Some(bracket_end) = trimmed.find(']') {
+                let rule_text = trimmed[bracket_end + 1..].trim();
+                return Some(reconstruct_from_ufw_line(rule_text));
+            }
+        }
+    }
+
+    None
+}
+
+/// Given a UFW status line like "22/tcp  ALLOW IN  Anywhere", reconstruct a `ufw add` command.
+fn reconstruct_from_ufw_line(line: &str) -> String {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 3 {
+        return format!("ufw allow {}", line);
+    }
+
+    let to_field = parts[0];
+    let mut action = "allow";
+    let mut direction = "in";
+    let mut from = "any";
+
+    for (i, p) in parts.iter().enumerate() {
+        let upper = p.to_uppercase();
+        match upper.as_str() {
+            "ALLOW" => action = "allow",
+            "DENY" => action = "deny",
+            "REJECT" => action = "reject",
+            "LIMIT" => action = "limit",
+            "IN" => direction = "in",
+            "OUT" => direction = "out",
+            _ => {
+                // Check if it's the from address (after "IN"/"OUT")
+                if i >= 3 && !p.starts_with('(') {
+                    from = p;
+                }
+            }
+        }
+    }
+
+    let (port, proto) = parse_ufw_to_field(to_field);
+
+    let mut cmd = format!("ufw {} {}", action, direction);
+    if proto != "any" {
+        cmd.push_str(&format!(" proto {}", proto));
+    }
+    if from != "any" && !from.eq_ignore_ascii_case("anywhere") {
+        cmd.push_str(&format!(" from {}", from));
+    } else {
+        cmd.push_str(" from any");
+    }
+    if port != "any" {
+        cmd.push_str(&format!(" to any port {}", port));
+    }
+
+    cmd
+}
+
+/// Remove all UFW rules whose status line contains the given comment tag.
+/// Iterates from highest rule number downward to avoid index shifting.
+fn remove_ufw_rules_by_comment(comment: &str) {
+    let out = Command::new("ufw").args(["status", "numbered"]).output();
+    if let Ok(o) = out {
+        let text = String::from_utf8_lossy(&o.stdout);
+        // Collect (number, _line) pairs for matching rules
+        let mut nums: Vec<u32> = Vec::new();
+        for line in text.lines() {
+            if !line.contains(comment) {
+                continue;
+            }
+            // e.g. "[ 3] Anywhere  DENY IN  Anywhere  (SentinelAI-Quarantine)"
+            if let Some(start) = line.find('[') {
+                if let Some(end) = line.find(']') {
+                    if let Ok(n) = line[start + 1..end].trim().parse::<u32>() {
+                        nums.push(n);
+                    }
+                }
+            }
+        }
+        // Delete from highest number first to keep indices stable
+        nums.sort_unstable();
+        nums.reverse();
+        for n in nums {
+            let _ = Command::new("sh")
+                .args(["-c", &format!("echo 'y' | ufw delete {}", n)])
+                .output();
+        }
     }
 }
 
@@ -825,15 +1296,24 @@ fn remove_quarantine(command_id: &str) -> CommandResult {
             exit_code: Some(0),
         }
     } else {
-        // Remove iptables quarantine rules (marked with comment)
-        let cmd = "iptables -S | grep 'SentinelAI-Quarantine' | sed 's/-A/-D/' | while read rule; do iptables $rule; done";
-        let _ = Command::new("sh").args(["-c", cmd]).output();
+        // Remove UFW quarantine rules
+        // Delete all SentinelAI-Quarantine deny rules by finding their numbers
+        let cmds = vec![
+            "echo 'y' | ufw delete deny in comment 'SentinelAI-Quarantine' 2>/dev/null",
+            "echo 'y' | ufw delete deny out comment 'SentinelAI-Quarantine' 2>/dev/null",
+        ];
+        for cmd in &cmds {
+            let _ = Command::new("sh").args(["-c", cmd]).output();
+        }
+
+        // Also clean up by searching numbered list for quarantine rules
+        remove_ufw_rules_by_comment("SentinelAI-Quarantine");
 
         CommandResult {
             command_id: command_id.to_string(),
             status: "completed".into(),
-            output: "Quarantine removed".into(),
-            data: Some(json!({ "quarantine_level": "none" })),
+            output: "Quarantine removed via UFW".into(),
+            data: Some(json!({ "quarantine_level": "none", "firewall": "ufw" })),
             exit_code: Some(0),
         }
     }
@@ -873,14 +1353,15 @@ fn apply_partial_quarantine(command_id: &str, params: &serde_json::Value) -> Com
             exit_code: Some(0),
         }
     } else {
-        // Linux: allow backend, block rest
-        let mut cmds = Vec::new();
+        // Linux: Use UFW — allow backend, then set default deny
+        let mut cmds: Vec<String> = Vec::new();
         if !backend_ip.is_empty() {
-            cmds.push(format!("iptables -I INPUT -s {} -j ACCEPT -m comment --comment \"SentinelAI-Quarantine\"", backend_ip));
-            cmds.push(format!("iptables -I OUTPUT -d {} -j ACCEPT -m comment --comment \"SentinelAI-Quarantine\"", backend_ip));
+            cmds.push(format!("ufw allow in from {} comment 'SentinelAI-Quarantine'", backend_ip));
+            cmds.push(format!("ufw allow out to {} comment 'SentinelAI-Quarantine'", backend_ip));
         }
-        cmds.push("iptables -A INPUT -j DROP -m comment --comment \"SentinelAI-Quarantine\"".into());
-        cmds.push("iptables -A OUTPUT -j DROP -m comment --comment \"SentinelAI-Quarantine\"".into());
+        // Insert deny-all rules at the end
+        cmds.push("ufw deny in from any comment 'SentinelAI-Quarantine'".into());
+        cmds.push("ufw deny out to any comment 'SentinelAI-Quarantine'".into());
 
         for cmd in &cmds {
             let _ = Command::new("sh").args(["-c", cmd]).output();
@@ -889,8 +1370,8 @@ fn apply_partial_quarantine(command_id: &str, params: &serde_json::Value) -> Com
         CommandResult {
             command_id: command_id.to_string(),
             status: "completed".into(),
-            output: format!("Partial quarantine applied"),
-            data: Some(json!({ "quarantine_level": "partial", "backend_ip": backend_ip })),
+            output: format!("Partial quarantine applied via UFW"),
+            data: Some(json!({ "quarantine_level": "partial", "backend_ip": backend_ip, "firewall": "ufw" })),
             exit_code: Some(0),
         }
     }
@@ -925,12 +1406,14 @@ fn apply_full_quarantine(command_id: &str, params: &serde_json::Value) -> Comman
             exit_code: Some(0),
         }
     } else {
-        let mut cmds = Vec::new();
+        // Linux: Use UFW — only allow heartbeat to backend on port 8000
+        let mut cmds: Vec<String> = Vec::new();
         if !backend_ip.is_empty() {
-            cmds.push(format!("iptables -I OUTPUT -d {} -p tcp --dport 8000 -j ACCEPT -m comment --comment \"SentinelAI-Quarantine\"", backend_ip));
+            cmds.push(format!("ufw allow out proto tcp to {} port 8000 comment 'SentinelAI-Quarantine'", backend_ip));
         }
-        cmds.push("iptables -A INPUT -j DROP -m comment --comment \"SentinelAI-Quarantine\"".into());
-        cmds.push("iptables -A OUTPUT -j DROP -m comment --comment \"SentinelAI-Quarantine\"".into());
+        // Block everything else
+        cmds.push("ufw deny in from any comment 'SentinelAI-Quarantine'".into());
+        cmds.push("ufw deny out to any comment 'SentinelAI-Quarantine'".into());
 
         for cmd in &cmds {
             let _ = Command::new("sh").args(["-c", cmd]).output();
@@ -939,8 +1422,8 @@ fn apply_full_quarantine(command_id: &str, params: &serde_json::Value) -> Comman
         CommandResult {
             command_id: command_id.to_string(),
             status: "completed".into(),
-            output: "FULL quarantine applied".into(),
-            data: Some(json!({ "quarantine_level": "full" })),
+            output: "FULL quarantine applied via UFW".into(),
+            data: Some(json!({ "quarantine_level": "full", "firewall": "ufw" })),
             exit_code: Some(0),
         }
     }

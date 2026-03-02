@@ -18,8 +18,8 @@ process_interval_secs = 10
 network_interval_secs = 15
 system_info_interval_secs = 30
 
-# Watched Paths (Windows)
-watch_paths = ["C:\\Users", "C:\\Windows\\Temp", "C:\\Windows\\System32"]
+# Watched Paths (Linux)
+watch_paths = ["/home", "/tmp", "/etc", "/var/log"]
 
 # File Hash Extensions
 hash_extensions = ["exe", "dll", "sys", "bat", "cmd", "ps1", "vbs", "js", "sh", "py"]
