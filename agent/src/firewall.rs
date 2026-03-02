@@ -62,6 +62,25 @@ fn list_rules_windows(command_id: &str) -> CommandResult {
         }
     }
 
+    // Dedup: Windows Firewall often contains identical duplicate rules
+    // (same Name+Direction+Action+Protocol+Port+Address+Profile).
+    // Keep only unique rules by hashing all key fields.
+    let mut seen = std::collections::HashSet::new();
+    all_rules.retain(|r| {
+        let key = format!("{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            r["Name"].as_str().unwrap_or(""),
+            r["Direction"].as_str().unwrap_or(""),
+            r["Action"].as_str().unwrap_or(""),
+            r["Protocol"].as_str().unwrap_or(""),
+            r["LocalPort"].as_str().unwrap_or(""),
+            r["RemotePort"].as_str().unwrap_or(""),
+            r["LocalAddress"].as_str().unwrap_or(""),
+            r["RemoteAddress"].as_str().unwrap_or(""),
+            r["Profile"].as_str().unwrap_or(""),
+        );
+        seen.insert(key)
+    });
+
     let count = all_rules.len();
     let rules_array = json!(all_rules);
 
@@ -456,10 +475,17 @@ fn add_rule_windows(command_id: &str, name: &str, direction: &str, action: &str,
                      protocol: &str, port: &str, remote_addr: &str, profiles: Option<&str>) -> CommandResult {
     let dir = if direction == "inbound" { "in" } else { "out" };
     let act = if action == "block" { "block" } else { "allow" };
+    let prefixed_name = format!("SentinelAI-{}", name);
+
+    // Delete any existing rule with the same name to prevent OS-level duplicates.
+    // `netsh delete rule` removes ALL rules matching the name, which is what we want.
+    let del_cmd = format!("netsh advfirewall firewall delete rule name=\"{}\"", prefixed_name);
+    let _ = Command::new("cmd").args(["/C", &del_cmd]).output();
+    // Ignore errors — rule may not exist yet, which is fine.
 
     let mut cmd_str = format!(
-        "netsh advfirewall firewall add rule name=\"SentinelAI-{}\" dir={} action={} protocol={}",
-        name, dir, act, protocol
+        "netsh advfirewall firewall add rule name=\"{}\" dir={} action={} protocol={}",
+        prefixed_name, dir, act, protocol
     );
 
     if !port.is_empty() {
@@ -489,7 +515,7 @@ fn add_rule_windows(command_id: &str, name: &str, direction: &str, action: &str,
                 status: if output.status.success() { "completed" } else { "error" }.into(),
                 output: format!("Rule added: {}\n{}", cmd_str, combined),
                 data: Some(json!({
-                    "rule_name": format!("SentinelAI-{}", name),
+                    "rule_name": prefixed_name,
                     "direction": direction,
                     "action": action,
                     "protocol": protocol,
