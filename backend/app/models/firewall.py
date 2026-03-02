@@ -8,7 +8,7 @@ and firewall policies for centralized management.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Index, String, Boolean, DateTime, Integer, Text, ForeignKey
+from sqlalchemy import Index, String, Boolean, DateTime, Integer, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -22,6 +22,7 @@ class FirewallRule(Base):
     __table_args__ = (
         Index("ix_firewall_rules_agent_direction_action", "agent_id", "direction", "action"),
         Index("ix_firewall_rules_agent_enabled", "agent_id", "enabled"),
+        UniqueConstraint("agent_id", "name", "direction", name="uq_firewall_rules_agent_name_direction"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

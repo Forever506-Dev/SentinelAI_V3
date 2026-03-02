@@ -225,7 +225,11 @@ async def track_rule(
     user_id: str | None = None,
     policy_id: str | None = None,
 ) -> FirewallRule:
-    """Track a firewall rule in the database after it's applied to an agent."""
+    """Track a firewall rule in the database after it's applied to an agent.
+
+    Uses upsert semantics: if a rule with the same (agent_id, name, direction)
+    already exists, it is updated in place rather than creating a duplicate row.
+    """
     # Normalise profiles: accept list or comma-separated string
     raw_profiles = rule_data.get("profiles", [])
     if isinstance(raw_profiles, str):
@@ -238,10 +242,43 @@ async def track_rule(
         else:
             raw_profiles = []
 
+    rule_name = rule_data.get("name", "unknown")
+    direction = rule_data.get("direction", "inbound")
+
+    # ── Check for existing rule with same (agent_id, name, direction) ──
+    existing_result = await db.execute(
+        select(FirewallRule)
+        .where(FirewallRule.agent_id == agent_id)
+        .where(FirewallRule.name == rule_name)
+        .where(FirewallRule.direction == direction)
+    )
+    existing = existing_result.scalar_one_or_none()
+
+    if existing:
+        # Update existing rule in place
+        logger.info("Updating existing tracked rule (dedup)",
+                     rule_id=str(existing.id), name=rule_name, agent_id=agent_id)
+        existing.action = rule_data.get("action", existing.action)
+        existing.protocol = rule_data.get("protocol", existing.protocol)
+        existing.local_port = rule_data.get("local_port", existing.local_port)
+        existing.remote_port = rule_data.get("remote_port", existing.remote_port)
+        existing.local_address = rule_data.get("local_address", existing.local_address)
+        existing.remote_address = rule_data.get("remote_address", existing.remote_address)
+        existing.enabled = rule_data.get("enabled", existing.enabled)
+        existing.profile = rule_data.get("profile", existing.profile)
+        existing.profiles = raw_profiles
+        existing.synced_at = datetime.now(timezone.utc)
+        existing.updated_at = datetime.now(timezone.utc)
+        if policy_id:
+            existing.policy_id = policy_id
+        await db.flush()
+        return existing
+
+    # ── Create new rule ──
     rule = FirewallRule(
         agent_id=agent_id,
-        name=rule_data.get("name", "unknown"),
-        direction=rule_data.get("direction", "inbound"),
+        name=rule_name,
+        direction=direction,
         action=rule_data.get("action", "block"),
         protocol=rule_data.get("protocol", "any"),
         local_port=rule_data.get("local_port", "any"),
