@@ -305,7 +305,11 @@ async def delete_firewall_rule(
     current_user: dict = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Delete a firewall rule. Admin+ only."""
+    """Delete a firewall rule. Admin+ only.
+
+    Also removes any duplicate tracked rows with the same (agent_id, name, direction)
+    to clean up historical duplication issues.
+    """
     result = await db.execute(
         select(FirewallRule)
         .where(FirewallRule.id == rule_id)
@@ -323,7 +327,37 @@ async def delete_firewall_rule(
     )
 
     if cmd_result.get("status") == "completed":
-        await db.delete(rule)
+        # Find all rules with the same name/direction (includes target + any old duplicates)
+        dup_result = await db.execute(
+            select(FirewallRule)
+            .where(FirewallRule.agent_id == agent_id)
+            .where(FirewallRule.name == rule.name)
+            .where(FirewallRule.direction == rule.direction)
+        )
+        dup_ids = [r.id for r in dup_result.scalars().all()]
+
+        if dup_ids:
+            # Nullify FK references in remediation_actions (audit trail is kept, just unlinked)
+            await db.execute(
+                select(RemediationAction)
+                .where(RemediationAction.rule_id.in_([str(d) for d in dup_ids]))
+            )
+            for ra_row in (await db.execute(
+                select(RemediationAction).where(RemediationAction.rule_id.in_([str(d) for d in dup_ids]))
+            )).scalars().all():
+                ra_row.rule_id = None
+
+            # Delete revisions
+            for rev in (await db.execute(
+                select(FirewallRuleRevision).where(FirewallRuleRevision.rule_id.in_(dup_ids))
+            )).scalars().all():
+                await db.delete(rev)
+
+            # Delete the rules themselves
+            for dup in (await db.execute(
+                select(FirewallRule).where(FirewallRule.id.in_(dup_ids))
+            )).scalars().all():
+                await db.delete(dup)
 
     return {
         "remediation_id": str(action.id),
