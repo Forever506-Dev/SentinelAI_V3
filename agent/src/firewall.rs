@@ -102,8 +102,14 @@ fn parse_netsh_rules(text: &str, default_direction: &str, out: &mut Vec<serde_js
     for line in text.lines() {
         let trimmed = line.trim();
 
-        // Skip separator lines and header noise
-        if trimmed.is_empty() || trimmed.starts_with("---") || trimmed.starts_with("No rules") {
+        // Skip visual separator lines (e.g. "------") — they appear *inside*
+        // each rule block right after the Rule Name, NOT between rules.
+        if trimmed.starts_with("---") {
+            continue;
+        }
+
+        // Blank lines and "No rules" markers delimit rule blocks
+        if trimmed.is_empty() || trimmed.starts_with("No rules") {
             if !current.is_empty() {
                 out.push(netsh_map_to_rule(&current, default_direction));
                 current.clear();
@@ -1504,7 +1510,13 @@ fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        // Find the nearest char boundary at or before max-1 bytes
+        // to avoid panicking on multi-byte UTF-8 (e.g. French « » \u{a0})
+        let mut end = max.saturating_sub(1);
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 
