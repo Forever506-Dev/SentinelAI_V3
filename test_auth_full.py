@@ -7,8 +7,14 @@ import urllib.error
 import json
 import os
 
-PYTHON = r"C:\Users\Administrateur\Desktop\EDR_LLM\SentinelAI_v2\.venv\Scripts\python.exe"
-BACKEND_DIR = r"C:\Users\Administrateur\Desktop\EDR_LLM\SentinelAI_v2\backend"
+_admin_password = os.environ.get("SENTINEL_ADMIN_PASSWORD")
+if not _admin_password:
+    print("Error: SENTINEL_ADMIN_PASSWORD environment variable is not set.")
+    print("Usage:  SENTINEL_ADMIN_PASSWORD='...' python test_auth_full.py")
+    sys.exit(1)
+
+PYTHON = sys.executable
+BACKEND_DIR = os.environ.get("SENTINEL_BACKEND_DIR", os.path.join(os.path.dirname(__file__), "backend"))
 BASE = "http://localhost:8080/api/v1/auth"
 
 # Start the server
@@ -77,9 +83,9 @@ def get(path, token):
 try:
     print()
     print("=" * 60)
-    print("TEST 1: Login with admin / SentinelAdmin2026!")
+    print("TEST 1: Login with admin / $SENTINEL_ADMIN_PASSWORD")
     print("=" * 60)
-    result = post("/login", {"username": "admin", "password": "SentinelAdmin2026!"})
+    result = post("/login", {"username": "admin", "password": _admin_password})
     if result:
         print(f"  access_token: {result.get('access_token', 'N/A')[:50]}...")
         print(f"  requires_2fa: {result.get('requires_2fa')}")
@@ -118,7 +124,7 @@ try:
     print("=" * 60)
     print("TEST 5: Change password (authenticated)")
     print("=" * 60)
-    result = post("/change-password", {"current_password": "SentinelAdmin2026!", "new_password": "SentinelAdmin2026!"}, token=token)
+    result = post("/change-password", {"current_password": _admin_password, "new_password": _admin_password}, token=token)
     if result:
         print(f"  message: {result.get('message')}")
 

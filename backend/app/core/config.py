@@ -5,7 +5,14 @@ Central configuration management using Pydantic Settings.
 All values can be overridden via environment variables or .env file.
 """
 
+import secrets
+import warnings
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Placeholder prefixes that MUST be replaced before production use
+_PLACEHOLDER_PREFIXES = ("CHANGE-ME",)
 
 
 class Settings(BaseSettings):
@@ -111,8 +118,55 @@ class Settings(BaseSettings):
     AUTO_APPROVE_FOR_ADMIN: bool = True
 
     # --- First-run admin seed ---
+    # Leave ADMIN_DEFAULT_PASSWORD unset (None) to have the application
+    # auto-generate a random password on first startup and print it once.
+    # Set this env var only when you need a predictable initial password
+    # (e.g. automated CI/CD pipelines). Never hard-code it in source.
     ADMIN_DEFAULT_EMAIL: str = "admin@sentinelai.local"
-    ADMIN_DEFAULT_PASSWORD: str = "SentinelAdmin2026!"
+    ADMIN_DEFAULT_PASSWORD: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_production_secrets(self) -> "Settings":
+        """
+        Reject placeholder / default secret values when running in production
+        mode (DEBUG=False).  In development mode a warning is emitted instead
+        so the stack still starts without forcing every developer to configure
+        every secret locally.
+        """
+        critical_fields = {
+            "SECRET_KEY": self.SECRET_KEY,
+            "JWT_SECRET_KEY": self.JWT_SECRET_KEY,
+            "REMEDIATION_HMAC_KEY": self.REMEDIATION_HMAC_KEY,
+        }
+
+        offending = [
+            name
+            for name, value in critical_fields.items()
+            if any(value.startswith(p) for p in _PLACEHOLDER_PREFIXES)
+        ]
+
+        if offending:
+            msg = (
+                f"[SentinelAI] The following settings still use insecure "
+                f"placeholder values: {', '.join(offending)}. "
+                "Generate real secrets with: openssl rand -hex 32"
+            )
+            if not self.DEBUG:
+                raise ValueError(msg + " — refusing to start in production mode.")
+            warnings.warn(msg, stacklevel=2)
+
+        return self
+
+    def generate_admin_password(self) -> str:
+        """Return a cryptographically random initial admin password (20 chars).
+
+        Uses URL-safe characters (letters + digits + hyphens/underscores) to
+        avoid shell-escaping issues when the password appears in scripts or
+        environment variable assignments.
+        """
+        import base64
+        raw = secrets.token_bytes(15)  # 15 bytes → 20 base64url chars (no padding)
+        return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
 settings = Settings()

@@ -55,16 +55,40 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             result = await db.execute(select(User).where(User.username == "admin"))
             admin = result.scalar_one_or_none()
             if not admin:
+                # Use the configured password or auto-generate a secure one
+                if settings.ADMIN_DEFAULT_PASSWORD:
+                    initial_password = settings.ADMIN_DEFAULT_PASSWORD
+                    password_source = "ADMIN_DEFAULT_PASSWORD env var"
+                else:
+                    initial_password = settings.generate_admin_password()
+                    password_source = "auto-generated"
+
                 admin = User(
                     email=settings.ADMIN_DEFAULT_EMAIL,
                     username="admin",
-                    hashed_password=hash_password(settings.ADMIN_DEFAULT_PASSWORD),
+                    hashed_password=hash_password(initial_password),
                     full_name="Administrator",
                     role="superadmin",
+                    must_change_password=True,
                 )
                 db.add(admin)
                 await db.commit()
-                logger.info("Default admin user created", email=settings.ADMIN_DEFAULT_EMAIL)
+                logger.info(
+                    "Default admin user created — CHANGE THIS PASSWORD",
+                    email=settings.ADMIN_DEFAULT_EMAIL,
+                    password_source=password_source,
+                )
+                if password_source == "auto-generated":
+                    # Print clearly so the operator can log in for the first time.
+                    # This is the ONLY time the password is visible.
+                    print(  # noqa: T201
+                        f"\n{'='*60}\n"
+                        f"  SENTINELAI FIRST-RUN ADMIN PASSWORD (change immediately)\n"
+                        f"  Username : admin\n"
+                        f"  Password : {initial_password}\n"
+                        f"  Email    : {settings.ADMIN_DEFAULT_EMAIL}\n"
+                        f"{'='*60}\n"
+                    )
             else:
                 logger.info("Admin user already exists, skipping seed")
     except Exception as e:

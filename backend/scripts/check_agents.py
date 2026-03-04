@@ -1,6 +1,14 @@
+import os
 import requests
 
-r = requests.post('http://localhost:8080/api/v1/auth/login', json={'username':'admin','password':'Admin123!'})
+_password = os.environ.get("SENTINEL_ADMIN_PASSWORD")
+if not _password:
+    raise SystemExit(
+        "Error: SENTINEL_ADMIN_PASSWORD environment variable is not set.\n"
+        "Usage:  SENTINEL_ADMIN_PASSWORD='...' python check_agents.py"
+    )
+
+r = requests.post('http://localhost:8080/api/v1/auth/login', json={'username':'admin','password':_password})
 token = r.json()['access_token']
 
 # Check decommissioned agents

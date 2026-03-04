@@ -1,6 +1,12 @@
 import asyncio
+import os
 import sys
-sys.path.insert(0, r"F:\SentinelAI\backend")
+
+_backend_dir = os.environ.get(
+    "SENTINEL_BACKEND_DIR",
+    os.path.join(os.path.dirname(__file__), "backend"),
+)
+sys.path.insert(0, _backend_dir)
 
 async def test():
     from app.core.database import async_session_factory, engine, Base

@@ -72,6 +72,11 @@ data/
 *.p12
 secrets/
 
+# Credential / test fixture files that may contain plaintext passwords
+# Keep *.example versions committed instead
+login.json
+register.json
+
 # ========================
 # Testing
 # ========================

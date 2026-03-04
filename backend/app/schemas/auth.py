@@ -57,6 +57,7 @@ class UserResponse(BaseModel):
     role: str
     is_active: bool
     totp_enabled: bool = False
+    must_change_password: bool = False
 
     model_config = {"from_attributes": True}
 

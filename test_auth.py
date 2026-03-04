@@ -2,9 +2,16 @@
 import urllib.request
 import urllib.error
 import json
+import os
 import sys
 
 BASE = "http://localhost:8080/api/v1/auth"
+
+_admin_password = os.environ.get("SENTINEL_ADMIN_PASSWORD")
+if not _admin_password:
+    print("Error: SENTINEL_ADMIN_PASSWORD environment variable is not set.")
+    print("Usage:  SENTINEL_ADMIN_PASSWORD='...' python test_auth.py")
+    sys.exit(1)
 
 def post(path, data):
     url = f"{BASE}{path}"
@@ -34,9 +41,9 @@ def get(path, token):
         return None
 
 print("=" * 60)
-print("TEST 1: Login with admin / SentinelAdmin2026!")
+print("TEST 1: Login with admin / $SENTINEL_ADMIN_PASSWORD")
 print("=" * 60)
-result = post("/login", {"username": "admin", "password": "SentinelAdmin2026!"})
+result = post("/login", {"username": "admin", "password": _admin_password})
 if result:
     print(f"  access_token: {result.get('access_token', 'N/A')[:40]}...")
     print(f"  requires_2fa: {result.get('requires_2fa')}")
@@ -76,7 +83,7 @@ print("=" * 60)
 print("TEST 5: Change password (authenticated)")
 print("=" * 60)
 url = f"{BASE}/change-password"
-body = json.dumps({"current_password": "SentinelAdmin2026!", "new_password": "SentinelAdmin2026!"}).encode()
+body = json.dumps({"current_password": _admin_password, "new_password": _admin_password}).encode()
 req = urllib.request.Request(url, data=body, headers={
     "Content-Type": "application/json",
     "Authorization": f"Bearer {token}"

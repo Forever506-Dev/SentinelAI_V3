@@ -10,13 +10,20 @@ import os
 
 import httpx
 
+# Test user credentials — override via environment variables
+_test_password = os.environ.get("SENTINEL_TEST_PASSWORD", "Test!2026x")
+_backend_dir = os.environ.get(
+    "SENTINEL_BACKEND_DIR",
+    os.path.join(os.path.dirname(__file__), "backend"),
+)
+
 # --- Start backend as detached subprocess ---
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 DETACHED_PROCESS = 0x00000008
 
 backend = subprocess.Popen(
     [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8080"],
-    cwd=r"F:\SentinelAI\backend",
+    cwd=_backend_dir,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
@@ -45,7 +52,7 @@ print("\n[REGISTER]")
 r = client.post(f"{API}/auth/register", json={
     "username": "testanalyst",
     "email": "analyst@sentinelai.dev",
-    "password": "Test!2026x",
+    "password": _test_password,
     "full_name": "Test Analyst",
 })
 if r.status_code == 201:
@@ -59,7 +66,7 @@ else:
 print("\n[LOGIN]")
 r = client.post(f"{API}/auth/login", json={
     "username": "testanalyst",
-    "password": "Test!2026x",
+    "password": _test_password,
 })
 print(f"  Status: {r.status_code}")
 if r.status_code != 200:
