@@ -49,13 +49,20 @@ fn verify_command_signature(params: &serde_json::Value, hmac_key: &str) -> Resul
         .and_then(|v| v.as_str())
         .ok_or("Missing _timestamp in command parameters")?;
 
-    // Check timestamp freshness (reject commands older than 5 minutes)
-    if let Ok(ts) = timestamp.parse::<f64>() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        let age = (now - ts).abs();
+    // Check timestamp freshness (reject commands older than 5 minutes).
+    // The backend sends ISO 8601 timestamps (e.g. "2026-03-04T16:56:10+00:00").
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let ts_epoch = timestamp.parse::<f64>().ok().or_else(|| {
+        // Try parsing as ISO 8601 via chrono
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .ok()
+            .map(|dt| dt.timestamp() as f64)
+    });
+    if let Some(ts) = ts_epoch {
+        let age = (now_epoch - ts).abs();
         if age > 300.0 {
             return Err(format!("Command too old: {:.0}s (max 300s)", age));
         }

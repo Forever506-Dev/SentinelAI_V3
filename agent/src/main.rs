@@ -269,9 +269,11 @@ async fn run_agent(shutdown_rx: oneshot::Receiver<()>) -> Result<(), Box<dyn std
                 Err(e) => {
                     let err_msg = e.to_string();
                     warn!(error = %e, "Heartbeat failed");
-                    // If backend rejected our identity (404/401), re-register
-                    if err_msg.contains("Heartbeat rejected") {
-                        warn!("Agent identity rejected by backend — attempting re-registration");
+                    // Re-register if the agent lost its identity or backend rejected it
+                    if err_msg.contains("Heartbeat rejected")
+                        || err_msg.contains("Agent not registered")
+                    {
+                        warn!("Agent not registered or rejected — attempting re-registration");
                         match heartbeat_client.register().await {
                             Ok(reg) => info!(agent_id = %reg.agent_id, "Re-registration successful"),
                             Err(re) => error!(error = %re, "Re-registration also failed"),
