@@ -31,7 +31,7 @@
 </div>
 
 <br/>
-<iframe src="https://osullivanquebecqcca-my.sharepoint.com/personal/viroussel_osullivan-quebec_qc_ca/_layouts/15/embed.aspx?UniqueId=c4ae6953-86cb-414b-b5bc-832022144d36&nav=%7B%22playbackOptions%22%3A%7B%22startTimeInSeconds%22%3A0%7D%7D&embed=%7B%22ust%22%3Afalse%2C%22hv%22%3A%22CopyEmbedCode%22%7D&referrer=StreamWebApp&referrerScenario=EmbedDialog.Create" width="1280" height="720" frameborder="0" scrolling="no" allowfullscreen title="SentinelAI_Demo.mp4"></iframe>
+https://osullivanquebecqcca-my.sharepoint.com/:v:/g/personal/viroussel_osullivan-quebec_qc_ca/IQBTaa7Ey4ZLQbW8gyAiFE02AWpcoAkN0YUEPCp94G_h6lU?e=VnqpaE
 ---
 
 <br/>
