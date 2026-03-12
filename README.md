@@ -31,7 +31,7 @@
 
 <br/>
 
-[![SentinelAI EDR Demo](https://raw.githubusercontent.com/Forever506-Dev/SentinelAI_V3/main/assets/demo/SentinelAI-Demo.png)](https://osullivanquebecqcca-my.sharepoint.com/:v:/g/personal/viroussel_osullivan-quebec_qc_ca/IQBTaa7Ey4ZLQbW8gyAiFE02AWpcoAkN0YUEPCp94G_h6lU?e=VnqpaE)
+[![SentinelAI EDR Demo](https://raw.githubusercontent.com/Forever506-Dev/SentinelAI_V3/main/assets/demo/SentinelAI-Demo.png)](https://osullivanquebecqcca-my.sharepoint.com/:v:/g/personal/viroussel_osullivan-quebec_qc_ca/IQBTaa7Ey4ZLQbW8gyAiFE02AW8TcxitLFDIpc1GnGnPDxc)
 
 <br/>
 
