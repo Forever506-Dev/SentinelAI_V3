@@ -14,7 +14,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 
 # System information
-sysinfo = "0.30"
+sysinfo = "0.38"
 
 # File system watching
 notify = "6"
