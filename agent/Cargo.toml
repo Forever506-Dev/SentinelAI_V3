@@ -58,7 +58,7 @@ windows = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Security",
 ]}
-windows-service = "0.7"
+windows-service = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.27", features = ["net", "process", "signal"] }
