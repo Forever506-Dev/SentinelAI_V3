@@ -342,7 +342,9 @@ async fn run_agent(shutdown_rx: oneshot::Receiver<()>) -> Result<(), Box<dyn std
         }
     });
 
-    // Event processing loop: detect locally then batch and send telemetry
+    // Event processing loop: detect locally then batch and send telemetry.
+    // Failed batches are retried up to MAX_TELEMETRY_RETRIES times with
+    // exponential backoff before being dropped.
     let transport_client = Arc::clone(&client);
     let batch_size = config.telemetry_batch_size;
     let telemetry_handle = tokio::spawn(async move {
@@ -350,6 +352,9 @@ async fn run_agent(shutdown_rx: oneshot::Receiver<()>) -> Result<(), Box<dyn std
         let mut flush_interval = tokio::time::interval(
             tokio::time::Duration::from_secs(10)
         );
+        // Pending retry queue: (events, attempt_number)
+        let mut retry_queue: Vec<(Vec<TelemetryEvent>, u32)> = Vec::new();
+        const MAX_TELEMETRY_RETRIES: u32 = 3;
 
         // Initialize local detection engine
         let detection = DetectionEngine::new();
@@ -359,6 +364,34 @@ async fn run_agent(shutdown_rx: oneshot::Receiver<()>) -> Result<(), Box<dyn std
         );
 
         loop {
+            // Drain the retry queue first (oldest failed batches)
+            let mut next_retry: Vec<(Vec<TelemetryEvent>, u32)> = Vec::new();
+            for (failed_events, attempt) in retry_queue.drain(..) {
+                // Exponential backoff: wait 2^attempt seconds (2s, 4s, 8s)
+                let backoff = tokio::time::Duration::from_secs(2u64.pow(attempt));
+                tokio::time::sleep(backoff).await;
+                match transport_client.send_telemetry(failed_events.clone()).await {
+                    Ok(_) => info!(attempt, "Telemetry retry succeeded"),
+                    Err(e) if attempt < MAX_TELEMETRY_RETRIES => {
+                        warn!(
+                            error = %e,
+                            attempt,
+                            "Telemetry retry failed, will retry again"
+                        );
+                        next_retry.push((failed_events, attempt + 1));
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            events = failed_events.len(),
+                            "Telemetry batch dropped after {} retries",
+                            MAX_TELEMETRY_RETRIES
+                        );
+                    }
+                }
+            }
+            retry_queue = next_retry;
+
             tokio::select! {
                 Some(event) = event_rx.recv() => {
                     // ── Local Detection: evaluate event against rules ──
@@ -384,16 +417,18 @@ async fn run_agent(shutdown_rx: oneshot::Receiver<()>) -> Result<(), Box<dyn std
                     batch.push(event);
                     if batch.len() >= batch_size {
                         let events = std::mem::take(&mut batch);
-                        if let Err(e) = transport_client.send_telemetry(events).await {
-                            warn!(error = %e, "Failed to send telemetry batch");
+                        if let Err(e) = transport_client.send_telemetry(events.clone()).await {
+                            warn!(error = %e, "Telemetry batch failed, queuing for retry");
+                            retry_queue.push((events, 1));
                         }
                     }
                 }
                 _ = flush_interval.tick() => {
                     if !batch.is_empty() {
                         let events = std::mem::take(&mut batch);
-                        if let Err(e) = transport_client.send_telemetry(events).await {
-                            warn!(error = %e, "Failed to flush telemetry batch");
+                        if let Err(e) = transport_client.send_telemetry(events.clone()).await {
+                            warn!(error = %e, "Telemetry flush failed, queuing for retry");
+                            retry_queue.push((events, 1));
                         }
                     }
                 }
