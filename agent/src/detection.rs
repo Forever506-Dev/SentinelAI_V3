@@ -5,6 +5,7 @@
 //! are flagged as alerts; everything else is sent to the backend for
 //! deeper AI-powered analysis.
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
@@ -35,11 +36,22 @@ pub enum Severity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RuleType {
+    /// Substring case-insensitive match on process name.
     ProcessName(String),
+    /// Exact case-insensitive process name match (with or without .exe suffix).
+    /// Avoids false positives from substring matches (e.g. "whoami" won't match
+    /// "notamalware_whoami_helper").
+    ProcessNameExact(String),
+    /// Substring match on the full command line.
     ProcessCommandLine(String),
+    /// Regex match on the full command line — use for precise patterns that
+    /// need to avoid false positives (e.g. Base64 payload detection).
+    ProcessCommandLineRegex(String),
+    /// Substring match on file path.
     FilePathPattern(String),
     NetworkPort(u16),
     NetworkDestination(String),
+    /// All sub-rules must match (AND logic).
     Combined(Vec<RuleType>),
 }
 
@@ -121,13 +133,30 @@ fn rule_matches(rule: &DetectionRule, event: &TelemetryEvent) -> bool {
             if event.event_type != EventType::Process {
                 return false;
             }
-            // Check both "process_name" (from collector) and "name" (legacy)
             event
                 .data
                 .get("process_name")
                 .or_else(|| event.data.get("name"))
                 .and_then(|v| v.as_str())
                 .map(|n| n.to_lowercase().contains(&name.to_lowercase()))
+                .unwrap_or(false)
+        }
+
+        RuleType::ProcessNameExact(name) => {
+            if event.event_type != EventType::Process {
+                return false;
+            }
+            // Matches exact process name with or without .exe suffix.
+            let pattern = format!("(?i)^{}(\\.exe)?$", regex::escape(name));
+            let Ok(re) = Regex::new(&pattern) else {
+                return false;
+            };
+            event
+                .data
+                .get("process_name")
+                .or_else(|| event.data.get("name"))
+                .and_then(|v| v.as_str())
+                .map(|n| re.is_match(n))
                 .unwrap_or(false)
         }
 
@@ -143,11 +172,26 @@ fn rule_matches(rule: &DetectionRule, event: &TelemetryEvent) -> bool {
                 .unwrap_or(false)
         }
 
+        RuleType::ProcessCommandLineRegex(pattern) => {
+            if event.event_type != EventType::Process {
+                return false;
+            }
+            let Ok(re) = Regex::new(&format!("(?i){}", pattern)) else {
+                warn!(pattern = %pattern, "Invalid regex in detection rule — skipping");
+                return false;
+            };
+            event
+                .data
+                .get("command_line")
+                .and_then(|v| v.as_str())
+                .map(|cmd| re.is_match(cmd))
+                .unwrap_or(false)
+        }
+
         RuleType::FilePathPattern(pattern) => {
             if event.event_type != EventType::File {
                 return false;
             }
-            // Check both "file_path" (from collector) and "path" (legacy)
             event
                 .data
                 .get("file_path")
@@ -182,7 +226,6 @@ fn rule_matches(rule: &DetectionRule, event: &TelemetryEvent) -> bool {
         }
 
         RuleType::Combined(sub_rules) => {
-            // All sub-rules must match (AND logic)
             sub_rules.iter().all(|sr| {
                 let tmp = DetectionRule {
                     id: rule.id.clone(),
@@ -214,6 +257,8 @@ fn builtin_rules() -> Vec<DetectionRule> {
             rule_type: RuleType::ProcessName("mimikatz".into()),
         },
         // ── Execution: PowerShell Encoded Command ───────────────
+        // DETECT-002 keeps the broad substring match as a fast pre-filter.
+        // DETECT-014 adds a precise regex check with Base64 payload validation.
         DetectionRule {
             id: "DETECT-002".into(),
             name: "Encoded PowerShell Command".into(),
@@ -284,13 +329,15 @@ fn builtin_rules() -> Vec<DetectionRule> {
             rule_type: RuleType::NetworkPort(4444),
         },
         // ── Discovery: whoami ───────────────────────────────────
+        // Uses ProcessNameExact to avoid false positives on process names
+        // that merely contain "whoami" as a substring.
         DetectionRule {
             id: "DETECT-010".into(),
             name: "Reconnaissance: whoami".into(),
             description: "whoami.exe execution — common in initial recon after compromise".into(),
             severity: Severity::Low,
             mitre_technique: Some("T1033".into()),
-            rule_type: RuleType::ProcessName("whoami".into()),
+            rule_type: RuleType::ProcessNameExact("whoami".into()),
         },
         // ── Exfiltration: Rclone ────────────────────────────────
         DetectionRule {
@@ -302,13 +349,36 @@ fn builtin_rules() -> Vec<DetectionRule> {
             rule_type: RuleType::ProcessName("rclone".into()),
         },
         // ── Execution: Windows Script Host ──────────────────────
+        // Split into two exact-match rules (wscript / cscript) to avoid
+        // matching legitimate processes with those strings in their name.
         DetectionRule {
             id: "DETECT-012".into(),
-            name: "Script Host: wscript/cscript".into(),
-            description: "Windows Script Host executing scripts — potential malicious VBS/JS".into(),
+            name: "Script Host: wscript".into(),
+            description: "wscript.exe process detected — Windows Script Host, potential malicious VBS/JS".into(),
             severity: Severity::Medium,
             mitre_technique: Some("T1059.005".into()),
-            rule_type: RuleType::ProcessName("wscript".into()),
+            rule_type: RuleType::ProcessNameExact("wscript".into()),
+        },
+        DetectionRule {
+            id: "DETECT-013".into(),
+            name: "Script Host: cscript".into(),
+            description: "cscript.exe process detected — Windows Script Host variant".into(),
+            severity: Severity::Medium,
+            mitre_technique: Some("T1059.005".into()),
+            rule_type: RuleType::ProcessNameExact("cscript".into()),
+        },
+        // ── Execution: Encoded PowerShell (precise regex) ───────
+        // Complements DETECT-002 with a stricter regex that requires an
+        // actual Base64-looking payload after the flag, reducing noise.
+        DetectionRule {
+            id: "DETECT-014".into(),
+            name: "Encoded PowerShell Command (regex)".into(),
+            description: "PowerShell -enc/-en/-EncodedCommand flag followed by Base64 payload".into(),
+            severity: Severity::High,
+            mitre_technique: Some("T1059.001".into()),
+            rule_type: RuleType::ProcessCommandLineRegex(
+                r"powershell(\.exe)?\s+.*-(e(nc(odedcommand)?)?|en)\s+[A-Za-z0-9+/=]{20,}".into()
+            ),
         },
     ]
 }

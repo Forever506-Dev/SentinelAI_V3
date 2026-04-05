@@ -17,7 +17,8 @@ tokio = { version = "1", features = ["full"] }
 sysinfo = "0.38"
 
 # File system watching
-notify = "6"
+notify = "8"
+regex = { version = "1", features = ["std"] }
 
 # HTTP client for backend communication
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
