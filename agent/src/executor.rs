@@ -29,7 +29,48 @@ pub struct CommandResult {
 const SIGNED_COMMANDS: &[&str] = &[
     "firewall_add", "firewall_delete", "firewall_edit", "firewall_toggle",
     "firewall_block_ip", "firewall_block_port", "quarantine_set",
+    // shell requires HMAC too — it's the most dangerous command
+    "shell",
 ];
+
+/// Shell command patterns that are always blocked, regardless of HMAC.
+/// These protect against backend compromise or credential theft.
+/// Patterns are checked case-insensitively as substrings of the command.
+const BLOCKED_SHELL_PATTERNS: &[&str] = &[
+    // Destructive filesystem operations
+    "rm -rf", "rm -fr", "rmdir /s", "format ", "mkfs",
+    "dd if=/dev", "shred ",
+    // Credential theft
+    "/etc/shadow", "/etc/passwd", "sam database",
+    "reg save hklm\\sam", "reg save hklm\\system",
+    "lsass", "procdump",
+    // Reverse shells / network exfiltration
+    "bash -i", "nc -e", "ncat -e", "ncat --exec",
+    "/dev/tcp/", "/dev/udp/",
+    "curl|sh", "curl | sh", "wget|sh", "wget | sh",
+    // Privilege escalation helpers
+    "chmod 777 /", "chmod -R 777 /",
+    "chown -R root",
+    // Persistence mechanisms
+    "crontab -", "at now",
+    // Self-modification / agent tampering
+    "sentinelai", "sentinel-agent",
+];
+
+/// Validate a shell command against the blocked patterns list.
+/// Returns Ok(()) if safe, Err(reason) if blocked.
+fn validate_shell_command(shell_cmd: &str) -> Result<(), String> {
+    let lower = shell_cmd.to_lowercase();
+    for pattern in BLOCKED_SHELL_PATTERNS {
+        if lower.contains(&pattern.to_lowercase()) {
+            return Err(format!(
+                "Shell command blocked: contains forbidden pattern '{}'",
+                pattern
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Verify HMAC-SHA256 signature on a command's parameters.
 /// Returns Ok(()) if valid, Err(message) if invalid or missing.
@@ -172,6 +213,19 @@ fn execute_shell(cmd: &AgentCommand, command_id: &str) -> CommandResult {
             command_id: command_id.to_string(),
             status: "error".into(),
             output: "No command specified in parameters.command".into(),
+            data: None,
+            exit_code: None,
+        };
+    }
+
+    // Enforce shell command allowlist — blocks dangerous patterns even if
+    // HMAC is valid (defence-in-depth against backend compromise).
+    if let Err(reason) = validate_shell_command(shell_cmd) {
+        warn!(shell_command = %shell_cmd, reason = %reason, "Shell command blocked by allowlist");
+        return CommandResult {
+            command_id: command_id.to_string(),
+            status: "error".into(),
+            output: format!("Blocked: {}", reason),
             data: None,
             exit_code: None,
         };
