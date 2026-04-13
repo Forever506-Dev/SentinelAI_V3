@@ -143,7 +143,7 @@ jobs:
         uses: actions/download-artifact@v8
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             sentinel-agent-windows-x86_64.exe/sentinel-agent-windows-x86_64.exe
