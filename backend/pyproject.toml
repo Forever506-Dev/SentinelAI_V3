@@ -16,7 +16,7 @@ dependencies = [
     # Database
     "sqlalchemy[asyncio]>=2.0.25",
     "asyncpg>=0.29.0",
-    "alembic>=1.13.0",
+    "alembic>=1.18.4",
 
     # Redis
     "redis[hiredis]>=5.0.0",
